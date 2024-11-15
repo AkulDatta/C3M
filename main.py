@@ -150,7 +150,7 @@ def loss_pos_matrix_random_sampling(A):
 
 def loss_pos_matrix_eigen_values(A):
     # A: bs x d x d
-    eigv = torch.symeig(A, eigenvectors=True)[0].view(-1)
+    eigv = torch.linalg.eigvalsh(A).view(-1)
     negative_index = eigv.detach().cpu().numpy() < 0
     negative_eigv = eigv[negative_index]
     return negative_eigv.norm()
@@ -202,7 +202,7 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     if verbose:
         print(torch.symeig(Contraction)[0].min(dim=1)[0].mean(), torch.symeig(Contraction)[0].max(dim=1)[0].mean(), torch.symeig(Contraction)[0].mean())
     if acc:
-        return loss, ((torch.symeig(Contraction)[0]>=0).sum(dim=1)==0).cpu().detach().numpy(), ((torch.symeig(C1_LHS_1)[0]>=0).sum(dim=1)==0).cpu().detach().numpy(), sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s]).item()
+        return loss, ((torch.linalg.eigvalsh(Contraction)>=0).sum(dim=1)==0).cpu().detach().numpy(), ((torch.linalg.eigvalsh(C1_LHS_1)>=0).sum(dim=1)==0).cpu().detach().numpy(), sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s]).item()
     else:
         return loss, None, None, None
 
