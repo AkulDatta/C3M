@@ -104,10 +104,10 @@ def Jacobian_Matrix(M, x):
     bs = x.shape[0]
     m = M.size(-1)
     n = x.size(1)
-    J = torch.zeros(bs, m, m, n).type(x.type())
+    J = torch.zeros(bs, m, m, n, device=x.device, dtype=x.dtype)
     for i in range(m):
         for j in range(m):
-            J[:, i, j, :] = grad(M[:, i, j].sum(), x, create_graph=True)[0].squeeze(-1)
+            J[:, i, j, :] = torch.autograd.grad(M[:, i, j].sum(), x, create_graph=True)[0].squeeze(-1)
     return J
 
 def Jacobian(f, x):
@@ -119,9 +119,9 @@ def Jacobian(f, x):
     bs = x.shape[0]
     m = f.size(1)
     n = x.size(1)
-    J = torch.zeros(bs, m, n).type(x.type())
+    J = torch.zeros(bs, m, n, device=x.device, dtype=x.dtype)
     for i in range(m):
-        J[:, i, :] = grad(f[:, i, 0].sum(), x, create_graph=True)[0].squeeze(-1)
+        J[:, i, :] = torch.autograd.grad(f[:, i, 0].sum(), x, create_graph=True)[0].squeeze(-1)
     return J
 
 def weighted_gradients(W, v, x, detach=False):
@@ -138,15 +138,14 @@ K = 1024
 def loss_pos_matrix_random_sampling(A):
     # A: bs x d x d
     # z: K x d
-    z = torch.randn(K, A.size(-1)).cuda()
-    z = z / z.norm(dim=1, keepdim=True)
-    zTAz = (z.matmul(A) * z.view(1,K,-1)).sum(dim=2).view(-1)
+    z = torch.randn(K, A.size(-1), device=A.device)
+    z = F.normalize(z, dim=1)
+    zTAz = torch.sum(z.matmul(A) * z.view(1, K, -1), dim=2).view(-1)
     negative_index = zTAz.detach().cpu().numpy() < 0
-    if negative_index.sum()>0:
+    if negative_index.any():
         negative_zTAz = zTAz[negative_index]
-        return -1.0 * (negative_zTAz.mean())
-    else:
-        return torch.tensor(0.).type(z.type()).requires_grad_()
+        return -1.0 * negative_zTAz.mean()
+    return torch.tensor(0., device=A.device, requires_grad=True)
 
 def loss_pos_matrix_eigen_values(A):
     # A: bs x d x d
