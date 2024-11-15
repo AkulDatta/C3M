@@ -121,4 +121,9 @@ if __name__ == '__main__':
 
     plt.subplots_adjust(left=left, bottom=bottom, right=right, top=top)
     plt.legend(frameon=True)
+    
+    save_dir = os.path.join(os.path.dirname(args.pretrained), 'graphs')
+    os.makedirs(save_dir, exist_ok=True)    
+    save_path = os.path.join(save_dir, f'plot_{args.task}_{args.plot_type}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
