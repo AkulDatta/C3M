@@ -14,6 +14,10 @@ sys.path.append('configs')
 sys.path.append('models')
 import argparse
 
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
+torch.set_num_threads(4)
+
 np.random.seed(1024)
 
 parser = argparse.ArgumentParser(description="")
