@@ -26,8 +26,8 @@ parser.add_argument('--task', type=str,
 parser.add_argument('--no_cuda', dest='use_cuda', action='store_false', help='Disable cuda.')
 parser.set_defaults(use_cuda=True)
 parser.add_argument('--bs', type=int, default=1024, help='Batch size.')
-parser.add_argument('--num_train', type=int, default=131072, help='Number of samples for training.')
-parser.add_argument('--num_test', type=int, default=32768, help='Number of samples for testing.')
+parser.add_argument('--num_train', type=int, default=131072, help='Number of samples for training.') # 4096 * 32
+parser.add_argument('--num_test', type=int, default=32768, help='Number of samples for testing.') # 1024 * 32
 parser.add_argument('--lr', dest='learning_rate', type=float, default=0.001, help='Base learning rate.')
 parser.add_argument('--epochs', type=int, default=15, help='Number of training epochs.')
 parser.add_argument('--lr_step', type=int, default=5, help='')
@@ -50,6 +50,8 @@ X_MIN = config.X_MIN
 X_MAX = config.X_MAX
 U_MIN = config.UREF_MIN
 U_MAX = config.UREF_MAX
+XE_MIN = config.XE_MIN
+XE_MAX = config.XE_MAX
 
 system = importlib.import_module('system_'+args.task)
 f_func = system.f_func
@@ -64,28 +66,36 @@ get_model = model.get_model
 
 model_W, model_Wbot, model_u_w1, model_u_w2, W_func, u_func = get_model(num_dim_x, num_dim_control, w_lb=args.w_lb, use_cuda=args.use_cuda)
 
-# Modified sampling functions
-def sample_x():
+# constructing datasets
+def sample_xef():
     return (X_MAX-X_MIN) * np.random.rand(num_dim_x, 1) + X_MIN
 
-def sample_u_ref():
+# def sample_x(xref):
+#     xe = (XE_MAX-XE_MIN) * np.random.rand(num_dim_x, 1) + XE_MIN
+#     x = xref + xe
+#     x[x>X_MAX] = X_MAX[x>X_MAX]
+#     x[x<X_MIN] = X_MIN[x<X_MIN]
+#     return x
+
+def sample_x(xref):
+    xe = (XE_MAX-XE_MIN) * np.random.rand(num_dim_x, 1) + XE_MIN
+    x = xe
+    return x
+
+def sample_uref():
     return (U_MAX-U_MIN) * np.random.rand(num_dim_control, 1) + U_MIN
 
-def sample_training():
-    x = sample_x()
-    u_ref = sample_u_ref()
-    return (x, u_ref)
+def sample_full():
+    xref = sample_xef()
+    uref = sample_uref()
+    x = sample_x(xref)
+    return (x, xref, uref)
 
-def sample_validation():
-    x = sample_x()
-    return (x,)
-
-# Create separate training and validation datasets
-X_tr = [sample_training() for _ in range(args.num_train)]
-X_val = [sample_validation() for _ in range(args.num_test)]
+X_tr = [sample_full() for _ in range(args.num_train)]
+X_te = [sample_full() for _ in range(args.num_test)]
 
 if 'Bbot_func' not in locals():
-    def Bbot_func(x):
+    def Bbot_func(x): # columns of Bbot forms a basis of the null space of B^T
         bs = x.shape[0]
         Bbot = torch.cat((torch.eye(num_dim_x-num_dim_control, num_dim_x-num_dim_control),
             torch.zeros(num_dim_control, num_dim_x-num_dim_control)), dim=0)
@@ -95,6 +105,11 @@ if 'Bbot_func' not in locals():
         return Bbot.repeat(bs, 1, 1)
 
 def Jacobian_Matrix(M, x):
+    # NOTE that this function assume that data are independent of each other
+    # along the batch dimension.
+    # M: B x m x m
+    # x: B x n x 1
+    # ret: B x m x m x n
     bs = x.shape[0]
     m = M.size(-1)
     n = x.size(1)
@@ -105,7 +120,11 @@ def Jacobian_Matrix(M, x):
     return J
 
 def Jacobian(f, x):
-    f = f + 0. * x.sum()
+    # NOTE that this function assume that data are independent of each other
+    f = f + 0. * x.sum() # to avoid the case that f is independent of x
+    # f: B x m x 1
+    # x: B x n x 1
+    # ret: B x m x n
     bs = x.shape[0]
     m = f.size(1)
     n = x.size(1)
@@ -115,6 +134,8 @@ def Jacobian(f, x):
     return J
 
 def weighted_gradients(W, v, x, detach=False):
+    # v, x: bs x n x 1
+    # DWDx: bs x n x n x n
     assert v.size() == x.size()
     bs = x.shape[0]
     if detach:
@@ -124,6 +145,8 @@ def weighted_gradients(W, v, x, detach=False):
 
 K = 1024
 def loss_pos_matrix_random_sampling(A):
+    # A: bs x d x d
+    # z: K x d
     z = torch.randn(K, A.size(-1), device=A.device)
     z = F.normalize(z, dim=1)
     zTAz = torch.sum(z.matmul(A) * z.view(1, K, -1), dim=2).view(-1)
@@ -134,45 +157,42 @@ def loss_pos_matrix_random_sampling(A):
     return torch.tensor(0., device=A.device, requires_grad=True)
 
 def loss_pos_matrix_eigen_values(A):
+    # A: bs x d x d
     eigv = torch.linalg.eigvalsh(A).view(-1)
     negative_index = eigv.detach().cpu().numpy() < 0
     negative_eigv = eigv[negative_index]
     return negative_eigv.norm()
 
-def forward(x, u=None, _lambda=0.0, verbose=False, acc=False, detach=False, training=True):
+def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
+    # x: bs x n x 1
     bs = x.shape[0]
     W = W_func(x)
     M = torch.inverse(W)
     f = f_func(x)
     B = B_func(x)
-    
-    if training:
-        assert u is not None
-        K = Jacobian(u, x)
-    else:
-        u = u_func(x)
-        K = Jacobian(u, x)
-
     DfDx = Jacobian(f, x)
     DBDx = torch.zeros(bs, num_dim_x, num_dim_x, num_dim_control).type(x.type())
     for i in range(num_dim_control):
         DBDx[:,:,:,i] = Jacobian(B[:,:,i].unsqueeze(-1), x)
 
     _Bbot = Bbot_func(x)
+    u = u_func(x, x, uref)
+    K = Jacobian(u, x)
 
     A = DfDx + sum([u[:, i, 0].unsqueeze(-1).unsqueeze(-1) * DBDx[:, :, :, i] for i in range(num_dim_control)])
     dot_x = f + B.matmul(u)
-    dot_M = weighted_gradients(M, dot_x, x, detach=detach)
-    dot_W = weighted_gradients(W, dot_x, x, detach=detach)
-    
+    dot_M = weighted_gradients(M, dot_x, x, detach=detach) # DMDt
+    dot_W = weighted_gradients(W, dot_x, x, detach=detach) # DWDt
     if detach:
         Contraction = dot_M + (A + B.matmul(K)).transpose(1,2).matmul(M.detach()) + M.detach().matmul(A + B.matmul(K)) + 2 * _lambda * M.detach()
     else:
         Contraction = dot_M + (A + B.matmul(K)).transpose(1,2).matmul(M) + M.matmul(A + B.matmul(K)) + 2 * _lambda * M
 
+    # C1
     C1_inner = - weighted_gradients(W, f, x) + DfDx.matmul(W) + W.matmul(DfDx.transpose(1,2)) + 2 * _lambda * W
-    C1_LHS_1 = _Bbot.transpose(1,2).matmul(C1_inner).matmul(_Bbot)
+    C1_LHS_1 = _Bbot.transpose(1,2).matmul(C1_inner).matmul(_Bbot) # this has to be a negative definite matrix
 
+    # C2
     C2_inners = []
     C2s = []
     for j in range(num_dim_control):
@@ -196,7 +216,9 @@ def forward(x, u=None, _lambda=0.0, verbose=False, acc=False, detach=False, trai
 
 optimizer = torch.optim.Adam(list(model_W.parameters()) + list(model_Wbot.parameters()) + list(model_u_w1.parameters()) + list(model_u_w2.parameters()), lr=args.learning_rate)
 
-def trainval(X, bs=args.bs, train=True, _lambda=args._lambda, acc=False, detach=False):
+def trainval(X, bs=args.bs, train=True, _lambda=args._lambda, acc=False, detach=False): # trainval a set of x
+    # torch.autograd.set_detect_anomaly(True)
+
     if train:
         indices = np.random.permutation(len(X))
     else:
@@ -211,49 +233,45 @@ def trainval(X, bs=args.bs, train=True, _lambda=args._lambda, acc=False, detach=
         _iter = tqdm(range(len(X) // bs))
     else:
         _iter = range(len(X) // bs)
-    
     for b in _iter:
-        if train:
-            x = []; u = [];
-            for id in indices[b*bs:(b+1)*bs]:
-                if args.use_cuda:
-                    x.append(torch.from_numpy(X[id][0]).float().cuda())
-                    u.append(torch.from_numpy(X[id][1]).float().cuda())
-                else:
-                    x.append(torch.from_numpy(X[id][0]).float())
-                    u.append(torch.from_numpy(X[id][1]).float())
-            x, u = (torch.stack(d).detach() for d in (x, u))
-        else:
-            x = []
-            for id in indices[b*bs:(b+1)*bs]:
-                if args.use_cuda:
-                    x.append(torch.from_numpy(X[id][0]).float().cuda())
-                else:
-                    x.append(torch.from_numpy(X[id][0]).float())
-            x = torch.stack(x).detach()
-            u = None
+        start = time.time()
+        x = []; xref = []; uref = [];
+        for id in indices[b*bs:(b+1)*bs]:
+            if args.use_cuda:
+                x.append(torch.from_numpy(X[id][0]).float().cuda())
+                xref.append(torch.from_numpy(X[id][1]).float().cuda())
+                uref.append(torch.from_numpy(X[id][2]).float().cuda())
+            else:
+                x.append(torch.from_numpy(X[id][0]).float())
+                xref.append(torch.from_numpy(X[id][1]).float())
+                uref.append(torch.from_numpy(X[id][2]).float())
 
+        x, xref, uref = (torch.stack(d).detach() for d in (x, xref, uref))
         x = x.requires_grad_()
 
-        loss, p1, p2, l3 = forward(x, u, _lambda=_lambda, verbose=False if not train else False, 
-                                 acc=acc, detach=detach, training=train)
+        start = time.time()
 
+        loss, p1, p2, l3 = forward(x, xref, uref, _lambda=_lambda, verbose=False if not train else False, acc=acc, detach=detach)
+
+        start = time.time()
         if train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            # print('backwad(): %.3f s'%(time.time() - start))
 
         total_loss += loss.item() * x.shape[0]
         if acc:
             total_p1 += p1.sum()
             total_p2 += p2.sum()
             total_l3 += l3 * x.shape[0]
-    
     return total_loss / len(X), total_p1 / len(X), total_p2 / len(X), total_l3/ len(X)
+
 
 best_acc = 0
 
 def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by every args.lr_step epochs"""
     lr = args.learning_rate * (0.1 ** (epoch // args.lr_step))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -262,7 +280,7 @@ for epoch in range(args.epochs):
     adjust_learning_rate(optimizer, epoch)
     loss, _, _, _ = trainval(X_tr, train=True, _lambda=args._lambda, acc=False, detach=True if epoch < args.lr_step else False)
     print("Training loss: ", loss)
-    loss, p1, p2, l3 = trainval(X_val, train=False, _lambda=0., acc=True, detach=False)
+    loss, p1, p2, l3 = trainval(X_te, train=False, _lambda=0., acc=True, detach=False)
     print("Epoch %d: Testing loss/p1/p2/l3: "%epoch, loss, p1, p2, l3)
 
     if p1+p2 >= best_acc:
